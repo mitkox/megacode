@@ -23,6 +23,7 @@ security issues.
   - `list_manifest`
   - `search_pattern`
   - `read_file`
+- `search_pattern` automatically uses ripgrep when available, with Python fallback.
 - Produces:
   - Markdown report
   - JSON metadata
@@ -32,6 +33,7 @@ security issues.
 
 - Python 3.9+
 - Deno (required by DSPy Python interpreter)
+- ripgrep (`rg`) recommended for fastest REPL `search_pattern` scans on large repos
 - OpenAI-compatible model endpoint (for example vLLM) reachable at
   `AUDIT_LM_API_BASE` (defaults to `http://localhost:8000/v1`)
 
@@ -86,12 +88,16 @@ Important model options:
 - `--api-key` API key (if required by your endpoint)
 - `--lm-max-tokens` response token ceiling per LM call
 
+Tip: for OpenAI-compatible endpoints (including vLLM), passing `mitko` is supported;
+the CLI auto-normalizes to `openai/mitko` for LiteLLM compatibility.
+
 Useful runtime options:
 
 - `--fast-mode` tighter defaults for faster/smaller-context runs
 - `--verbose` / `--no-verbose` DSPy RLM iteration logs
 - `--tool-max-lines`, `--tool-max-chars` bound file snippet payloads
 - `--search-max-files`, `--search-max-matches` bound regex search breadth
+- `--search-rg-chunk-size` files per `rg` batch for `search_pattern` backend
 - `--overview-top-files` shrink/expand overview prompt size
 
 ## Output Files

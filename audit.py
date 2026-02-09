@@ -4,10 +4,12 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -37,6 +39,7 @@ DEFAULT_TOOL_MAX_LINES = int(os.getenv("AUDIT_TOOL_MAX_LINES", "300"))
 DEFAULT_TOOL_MAX_CHARS = int(os.getenv("AUDIT_TOOL_MAX_CHARS", "30000"))
 DEFAULT_SEARCH_MAX_FILES = int(os.getenv("AUDIT_SEARCH_MAX_FILES", "1200"))
 DEFAULT_SEARCH_MAX_MATCHES = int(os.getenv("AUDIT_SEARCH_MAX_MATCHES", "300"))
+DEFAULT_SEARCH_RG_CHUNK_SIZE = int(os.getenv("AUDIT_SEARCH_RG_CHUNK_SIZE", "64"))
 DEFAULT_OVERVIEW_TOP_FILES = int(os.getenv("AUDIT_OVERVIEW_TOP_FILES", "25"))
 DEFAULT_API_KEY = os.getenv("AUDIT_API_KEY", "not-needed")
 DEFAULT_OUTPUT_REPORT = Path(
@@ -120,14 +123,14 @@ SECURITY_PATH_HINTS = (
     "cert",
 )
 SECURITY_SIGNAL_PATTERN = re.compile(
-    r"(?i)\\b("
+    r"(?i)\b("
     r"fromsqlraw|fromsqlinterpolated|executesqlraw|sqlcommand|commandtext|"
     r"process\\.start|ldap|binaryformatter|typenamehandling|deserialize|"
     r"html\\.raw|allowanonymous|authorize|jwt|tokenvalidation|"
     r"password|api[_-]?key|secret|connectionstring|"
     r"md5|sha1|aes|rsa|certificatevalidationcallback|"
     r"httpclient|webrequest|mappath|path\\.combine|upload"
-    r")\\b"
+    r")\b"
 )
 EXTENSION_PRIORITY = {
     ".cs": 10,
@@ -214,6 +217,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_SEARCH_MAX_MATCHES,
         help="Default max matches returned by search_pattern tool.",
+    )
+    parser.add_argument(
+        "--search-rg-chunk-size",
+        type=int,
+        default=DEFAULT_SEARCH_RG_CHUNK_SIZE,
+        help="Files per ripgrep batch when search_pattern uses the rg backend.",
     )
     parser.add_argument(
         "--overview-top-files",
@@ -322,6 +331,20 @@ def _check_prerequisites() -> None:
         )
 
 
+def _normalize_lm_model_id(model: str, api_base: str) -> str:
+    model = model.strip()
+    if not model:
+        raise ValueError("model cannot be empty")
+    if "/" in model:
+        return model
+    api_base = api_base.strip()
+    if api_base.startswith("http://") or api_base.startswith("https://"):
+        # DSPy uses LiteLLM under the hood; OpenAI-compatible endpoints usually
+        # require provider-qualified ids (openai/<model>).
+        return f"openai/{model}"
+    return model
+
+
 def _build_lm(model: str, api_base: str, max_tokens: int, api_key: str) -> Any:
     return dspy.LM(
         model,
@@ -381,6 +404,12 @@ def _score_manifest_entry(path: str, content_preview: str) -> tuple[int, int]:
 
 def _extension_priority(ext: str) -> int:
     return EXTENSION_PRIORITY.get(ext.lower(), 0)
+
+
+@lru_cache(maxsize=256)
+def _compile_pattern(pattern: str, ignore_case: bool) -> re.Pattern[str]:
+    flags = re.IGNORECASE if ignore_case else 0
+    return re.compile(pattern, flags)
 
 
 def collect_source_manifest(
@@ -593,11 +622,36 @@ def build_rlm_tools(
     default_tool_max_chars: int,
     default_search_max_files: int,
     default_search_max_matches: int,
+    default_search_rg_chunk_size: int = DEFAULT_SEARCH_RG_CHUNK_SIZE,
 ) -> list[Any]:
-    manifest_by_path = {
-        _normalize_relative_path(str(entry["path"])): entry for entry in manifest
-    }
+    manifest_by_path: dict[str, dict[str, Any]] = {}
+    for entry in manifest:
+        normalized = _normalize_relative_path(str(entry["path"]))
+        manifest_by_path[normalized] = entry
+
     ordered_paths = list(manifest_by_path.keys())
+    lower_paths = {path: path.lower() for path in ordered_paths}
+    paths_by_ext: dict[str, list[str]] = {}
+    for path in ordered_paths:
+        ext_key = str(manifest_by_path[path].get("ext", "")).lower()
+        paths_by_ext.setdefault(ext_key, []).append(path)
+    rg_bin = shutil.which("rg")
+
+    @lru_cache(maxsize=64)
+    def _read_text_cached(normalized_path: str) -> str:
+        target = _resolve_repo_path(source_root, normalized_path)
+        return target.read_text(encoding="utf-8", errors="ignore")
+
+    def _iter_filtered_paths(ext: str, path_contains: str) -> Iterator[str]:
+        base_paths = paths_by_ext.get(ext, []) if ext else ordered_paths
+        if not path_contains:
+            for path in base_paths:
+                yield path
+            return
+
+        for path in base_paths:
+            if path_contains in lower_paths[path]:
+                yield path
 
     def tool_help() -> dict[str, Any]:
         """Return tool usage rules and examples for repository access."""
@@ -629,13 +683,9 @@ def build_rlm_tools(
         path_contains = path_contains.lower().strip()
 
         selected: list[dict[str, Any]] = []
-        for path in ordered_paths:
+        for path in _iter_filtered_paths(ext, path_contains):
             entry = manifest_by_path[path]
             if int(entry.get("signal_score", 0)) < min_signal_score:
-                continue
-            if ext and str(entry.get("ext", "")).lower() != ext:
-                continue
-            if path_contains and path_contains not in path.lower():
                 continue
             selected.append(entry)
             if len(selected) >= limit:
@@ -659,8 +709,7 @@ def build_rlm_tools(
         max_chars = max(256, min(max_chars, 300000))
         start_line = max(1, start_line)
 
-        target = _resolve_repo_path(source_root, normalized)
-        text = target.read_text(encoding="utf-8", errors="ignore")
+        text = _read_text_cached(normalized)
         lines = text.splitlines()
         total_lines = len(lines)
 
@@ -711,22 +760,118 @@ def build_rlm_tools(
         )
         limit_files = max(1, min(limit_files, 10000))
         limit_matches = max(1, min(limit_matches, 5000))
-        flags = re.IGNORECASE if ignore_case else 0
-        regex = re.compile(pattern, flags)
+        try:
+            regex = _compile_pattern(pattern, ignore_case)
+        except re.error as exc:
+            raise ValueError(f"invalid regex pattern: {exc}") from exc
 
-        matches: list[dict[str, Any]] = []
-        scanned_files = 0
-        for rel_path in ordered_paths:
-            if scanned_files >= limit_files:
+        candidate_paths = []
+        for rel_path in _iter_filtered_paths(ext, path_contains):
+            candidate_paths.append(rel_path)
+            if len(candidate_paths) >= limit_files:
                 break
 
-            entry = manifest_by_path[rel_path]
-            if ext and str(entry.get("ext", "")).lower() != ext:
-                continue
-            if path_contains and path_contains not in rel_path.lower():
-                continue
+        if not candidate_paths:
+            return []
 
-            scanned_files += 1
+        def _search_with_rg() -> list[dict[str, Any]] | None:
+            if rg_bin is None:
+                return None
+
+            matches: list[dict[str, Any]] = []
+            remaining = limit_matches
+            chunk_size = max(1, min(default_search_rg_chunk_size, 256))
+
+            for start_idx in range(0, len(candidate_paths), chunk_size):
+                if remaining <= 0:
+                    break
+
+                chunk = candidate_paths[start_idx : start_idx + chunk_size]
+                cmd = [
+                    rg_bin,
+                    "--no-config",
+                    "--json",
+                    "--line-number",
+                    "--color",
+                    "never",
+                    "--max-count",
+                    str(remaining),
+                ]
+                if ignore_case:
+                    cmd.append("--ignore-case")
+                cmd.extend(["-e", pattern])
+                cmd.extend(chunk)
+
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        cwd=source_root,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                except OSError:
+                    return None
+
+                if result.returncode not in (0, 1):
+                    # Fallback to Python regex backend on rg parse/engine errors.
+                    return None
+
+                if not result.stdout:
+                    continue
+
+                for line in result.stdout.splitlines():
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        return None
+                    if event.get("type") != "match":
+                        continue
+
+                    data = event.get("data", {})
+                    path_obj = data.get("path", {})
+                    path_text = path_obj.get("text") if isinstance(path_obj, dict) else ""
+                    if not isinstance(path_text, str):
+                        continue
+                    normalized = _normalize_relative_path(path_text)
+                    if normalized not in manifest_by_path:
+                        continue
+
+                    line_no_obj = data.get("line_number", 0)
+                    try:
+                        line_no = int(line_no_obj)
+                    except (TypeError, ValueError):
+                        line_no = 0
+
+                    lines_obj = data.get("lines", {})
+                    preview = lines_obj.get("text", "") if isinstance(lines_obj, dict) else ""
+                    if not isinstance(preview, str):
+                        preview = str(preview)
+                    preview = preview.rstrip("\n")
+                    if len(preview) > 300:
+                        preview = preview[:300] + "..."
+
+                    matches.append(
+                        {
+                            "path": normalized,
+                            "line": line_no,
+                            "preview": preview,
+                        }
+                    )
+                    remaining -= 1
+                    if remaining <= 0:
+                        break
+
+            return matches
+
+        rg_matches = _search_with_rg()
+        if rg_matches is not None:
+            return rg_matches
+
+        matches: list[dict[str, Any]] = []
+        for rel_path in candidate_paths:
             target = _resolve_repo_path(source_root, rel_path)
             try:
                 with target.open("r", encoding="utf-8", errors="ignore") as handle:
@@ -889,6 +1034,8 @@ def main() -> int:
         raise ValueError("--search-max-files must be > 0")
     if args.search_max_matches <= 0:
         raise ValueError("--search-max-matches must be > 0")
+    if args.search_rg_chunk_size <= 0:
+        raise ValueError("--search-rg-chunk-size must be > 0")
     if args.overview_top_files <= 0:
         raise ValueError("--overview-top-files must be > 0")
     if args.lm_max_tokens <= 0:
@@ -921,6 +1068,8 @@ def main() -> int:
             args.search_max_files = 800
         if args.search_max_matches > 150:
             args.search_max_matches = 150
+        if args.search_rg_chunk_size > 32:
+            args.search_rg_chunk_size = 32
         if args.overview_top_files > 20:
             args.overview_top_files = 20
         print(
@@ -976,16 +1125,37 @@ def main() -> int:
         default_tool_max_chars=args.tool_max_chars,
         default_search_max_files=args.search_max_files,
         default_search_max_matches=args.search_max_matches,
+        default_search_rg_chunk_size=args.search_rg_chunk_size,
     )
+    rg_available = shutil.which("rg") is not None
+    if rg_available:
+        print("search_pattern backend: rg (auto-fallback to python).")
+    else:
+        print("search_pattern backend: python (rg not found).")
+
+    effective_lm_model = _normalize_lm_model_id(args.lm_model, args.lm_api_base)
+    effective_sub_lm_model = _normalize_lm_model_id(
+        args.sub_lm_model, args.lm_api_base
+    )
+    if effective_lm_model != args.lm_model:
+        print(
+            "Normalized --lm-model for LiteLLM/OpenAI compatibility: "
+            f"{args.lm_model} -> {effective_lm_model}"
+        )
+    if effective_sub_lm_model != args.sub_lm_model:
+        print(
+            "Normalized --sub-lm-model for LiteLLM/OpenAI compatibility: "
+            f"{args.sub_lm_model} -> {effective_sub_lm_model}"
+        )
 
     lm = _build_lm(
-        model=args.lm_model,
+        model=effective_lm_model,
         api_base=args.lm_api_base,
         max_tokens=args.lm_max_tokens,
         api_key=args.api_key,
     )
     sub_lm = _build_lm(
-        model=args.sub_lm_model,
+        model=effective_sub_lm_model,
         api_base=args.lm_api_base,
         max_tokens=args.lm_max_tokens,
         api_key=args.api_key,
@@ -1039,12 +1209,15 @@ def main() -> int:
             "tool_max_chars": args.tool_max_chars,
             "search_max_files": args.search_max_files,
             "search_max_matches": args.search_max_matches,
+            "search_rg_chunk_size": args.search_rg_chunk_size,
             "timeout_seconds": args.timeout_seconds,
             "backoff_seconds": args.backoff_seconds,
         },
         "models": {
             "primary": args.lm_model,
             "sub_lm": args.sub_lm_model,
+            "primary_resolved": effective_lm_model,
+            "sub_lm_resolved": effective_sub_lm_model,
             "api_base": args.lm_api_base,
             "max_tokens": args.lm_max_tokens,
         },
@@ -1052,6 +1225,7 @@ def main() -> int:
             "verbose": args.verbose,
             "skip_hidden_dirs": args.skip_hidden_dirs,
             "fast_mode": args.fast_mode,
+            "rg_available": rg_available,
         },
         "loader_stats": {
             "skipped_symlinks": stats["skipped_symlinks"],
